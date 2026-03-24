@@ -2355,60 +2355,59 @@ async def generate_first_letter(request: FirstLetterRequest):
     api_key = os.getenv("GOOGLE_API_KEY")
     e = request.entities
 
-    # ── Load financials: prefer the generated Excel SOA (PRD §49.1) ──────
+    # ── Load financials: Excel SOA is the AUTHORITATIVE source (PRD §49.1) ──
     # The demand letter table MUST match the Excel Statement of Account.
-    # If ground-truth already passed valid financials, respect them.
-    _has_financials = (
-        e.get("total_amount_owed")
-        and str(e["total_amount_owed"]).strip() not in ("", "0", "0.00", "See Ledger", "Review Required")
-    )
-    if not _has_financials:
-        # First: try reading the SOA from the most recent generated Excel
-        _soa = _read_soa_from_excel()
-        if _soa and _soa.get("total"):
-            _INVALID = ("", "0", "0.00", "See Ledger", "Review Required", None)
-            def _soa_set(key, val):
-                """Override entity field if current value is empty/invalid."""
-                if str(e.get(key, "")).strip() in _INVALID:
-                    e[key] = val
-            _soa_set("principal_balance",      f"{_soa.get('maintenance', 0):.2f}")
-            _soa_set("special_assessments",    f"{_soa.get('special_assessments', 0):.2f}")
-            _soa_set("late_fees",              f"{_soa.get('late_fees', 0):.2f}")
-            _soa_set("other_charges",          f"{_soa.get('other_charges', 0):.2f}")
-            _soa_set("certified_mail_charges", f"{_soa.get('certified_mail', 0):.2f}")
-            _soa_set("other_costs",            f"{_soa.get('other_costs', 0):.2f}")
-            _soa_set("attorney_fees",          f"{_soa.get('attorney_fees', 0):.2f}")
-            _soa_set("partial_payment",        f"{_soa.get('payments', 0):.2f}")
-            _soa_set("total_amount_owed",      f"{_soa['total']:.2f}")
-            _soa_set("total_balance",          f"{_soa['total']:.2f}")
-            if _soa.get("through_date_str"):
-                _soa_set("through_date_str", _soa["through_date_str"])
-            _has_financials = True
+    # ALWAYS read from the generated Excel SOA first — it is the single source
+    # of truth produced by generate_ledger. Entity dict values are secondary.
+    _has_financials = False
+    _soa = _read_soa_from_excel()
+    if _soa and _soa.get("total"):
+        # SOA is authoritative — ALWAYS override entity financial fields
+        e["principal_balance"]      = f"{_soa.get('maintenance', 0):.2f}"
+        e["special_assessments"]    = f"{_soa.get('special_assessments', 0):.2f}"
+        e["late_fees"]              = f"{_soa.get('late_fees', 0):.2f}"
+        e["other_charges"]          = f"{_soa.get('other_charges', 0):.2f}"
+        e["certified_mail_charges"] = f"{_soa.get('certified_mail', 0):.2f}"
+        e["other_costs"]            = f"{_soa.get('other_costs', 0):.2f}"
+        e["attorney_fees"]          = f"{_soa.get('attorney_fees', 0):.2f}"
+        e["partial_payment"]        = f"{_soa.get('payments', 0):.2f}"
+        e["total_amount_owed"]      = f"{_soa['total']:.2f}"
+        e["total_balance"]          = f"{_soa['total']:.2f}"
+        if _soa.get("through_date_str"):
+            e["through_date_str"] = _soa["through_date_str"]
+        _has_financials = True
 
-        # Fallback: re-parse uploads if no Excel SOA available
-        if not _has_financials:
-            _upload_files = [fp for fp in UPLOAD_DIR.iterdir()
-                             if fp.suffix.lower() in (".pdf", ".xlsx", ".xls", ".csv", ".docx")]
-            if _upload_files:
-                _disk_e = await _load_entities_from_uploads()
-                _identity_ok = (
-                    e
-                    and e.get("owner_name", "") not in ("", "Review Required")
-                    and len([v for v in e.values() if v and v not in ("—", "Review Required")]) >= 3
-                )
-                if not _identity_ok:
-                    e = _disk_e  # full override when frontend sent nothing useful
-                else:
-                    # Keep frontend identity; fill only MISSING financial values
-                    _financial_keys = {
-                        "principal_balance", "special_assessments", "late_fees",
-                        "other_charges", "certified_mail_charges", "other_costs",
-                        "attorney_fees", "partial_payment", "total_amount_owed",
-                        "total_balance", "through_date_str", "monthly_assessment",
-                    }
-                    for _k in _financial_keys:
-                        if _k in _disk_e and not e.get(_k):
-                            e[_k] = _disk_e[_k]
+    # Fallback: check if entities dict already has valid financials
+    if not _has_financials:
+        _has_financials = (
+            e.get("total_amount_owed")
+            and str(e["total_amount_owed"]).strip() not in ("", "0", "0.00", "See Ledger", "Review Required")
+        )
+
+    # Last resort: re-parse uploads if no Excel SOA and no entity financials
+    if not _has_financials:
+        _upload_files = [fp for fp in UPLOAD_DIR.iterdir()
+                         if fp.suffix.lower() in (".pdf", ".xlsx", ".xls", ".csv", ".docx")]
+        if _upload_files:
+            _disk_e = await _load_entities_from_uploads()
+            _identity_ok = (
+                e
+                and e.get("owner_name", "") not in ("", "Review Required")
+                and len([v for v in e.values() if v and v not in ("—", "Review Required")]) >= 3
+            )
+            if not _identity_ok:
+                e = _disk_e  # full override when frontend sent nothing useful
+            else:
+                # Keep frontend identity; fill only MISSING financial values
+                _financial_keys = {
+                    "principal_balance", "special_assessments", "late_fees",
+                    "other_charges", "certified_mail_charges", "other_costs",
+                    "attorney_fees", "partial_payment", "total_amount_owed",
+                    "total_balance", "through_date_str", "monthly_assessment",
+                }
+                for _k in _financial_keys:
+                    if _k in _disk_e and not e.get(_k):
+                        e[_k] = _disk_e[_k]
 
     today = datetime.date.today().strftime("%B %d, %Y")
 
@@ -3448,7 +3447,7 @@ async def generate_ledger(request: LedgerRequest):
                 _is_payment = _rtype in ("Payment Received",)
                 _is_credit  = _rtype in ("Credit/Waiver",) or (_credit > 0 and not _is_payment)
                 def _cv(val, cond):
-                    if _is_sep: return ""
+                    if _is_sep: return None
                     return round(val, 2) if cond and val else 0.00
                 desc = _clean_desc(item.get("description", ""))
                 if is_nola_anchor:
@@ -3487,7 +3486,7 @@ async def generate_ledger(request: LedgerRequest):
                 # Separator: pre-NOLA context header
                 nl_split_rows.append([
                     "", "", "── PRE-NOLA LEDGER HISTORY ──", "Separator",
-                    "", "", "", "", "", "", "", "", "", "", "Context: charges leading to NOLA balance"
+                    None, None, None, None, None, None, None, None, None, None, "Context: charges leading to NOLA balance"
                 ])
                 _pre_nola_count += 1
                 for _pn in pre_nola_items:
@@ -3565,7 +3564,7 @@ async def generate_ledger(request: LedgerRequest):
             if _projection_rows:
                 nl_split_rows.append([
                     "", "", "── 45-DAY FORWARD PROJECTION (PRD §42.6) ──",
-                    "Separator", "", "", "", "", "", "", "", "", "", "",
+                    "Separator", None, None, None, None, None, None, None, None, None, None,
                     "Projected charges — 45-day cure window"
                 ])
                 for _pr in _projection_rows:
@@ -3827,8 +3826,11 @@ async def generate_ledger(request: LedgerRequest):
                 _vr += 1
                 _status_cell = ws_soa.cell(row=_vr, column=1, value="Status")
                 _status_cell.font = Font(bold=True, size=9)
-                _sv = ws_soa.cell(row=_vr, column=2,
-                                  value=f'=IF(ABS(B{_vr-1})<0.01,"✓ VERIFIED — Sheets match","✗ MISMATCH — Review required")')
+                # Compute verification status in Python — unicode in Excel
+                # formulas causes "found a problem with content" corruption.
+                _var_val = abs(_soa_total - (net_balance + _soa_cert + _soa_ocost + _soa_atty))
+                _verify_text = "VERIFIED - Sheets match" if _var_val < 0.01 else "MISMATCH - Review required"
+                _sv = ws_soa.cell(row=_vr, column=2, value=_verify_text)
                 _sv.font = Font(bold=True, size=9)
 
             # ── Sheet 3: Association Ledger ───────────────────────────────────
@@ -3848,15 +3850,15 @@ async def generate_ledger(request: LedgerRequest):
                     _al_row.get("date", ""),
                     _al_row.get("description", ""),
                     _at,
-                    _ac if _abk == "maintenance" else "",
-                    _ac if _abk == "special"     else "",
-                    _ac if _abk == "water"       else "",
-                    _ac if _abk == "interest"    else "",
-                    _ac if _abk == "late_fees"   else "",
-                    _ac if _abk == "legal_atty"  else "",
-                    _ac if _abk == "other"       else "",
-                    _ar if _al_is_payment        else "",   # Payments
-                    _ar if (_ar > 0 and not _al_is_payment) else "",  # Credits
+                    _ac if _abk == "maintenance" else None,
+                    _ac if _abk == "special"     else None,
+                    _ac if _abk == "water"       else None,
+                    _ac if _abk == "interest"    else None,
+                    _ac if _abk == "late_fees"   else None,
+                    _ac if _abk == "legal_atty"  else None,
+                    _ac if _abk == "other"       else None,
+                    _ar if _al_is_payment        else None,   # Payments
+                    _ar if (_ar > 0 and not _al_is_payment) else None,  # Credits
                     _al_running,
                     _al_row.get("notes", ""),
                 ])
@@ -3975,24 +3977,24 @@ async def generate_ledger(request: LedgerRequest):
                 _vpct   = (_vdelta / nola_balance_anchor * 100) if nola_balance_anchor else None
 
             if _vdelta is None:
-                _vstatus = "⏳ PENDING — NOLA or ledger balance not available for comparison"
+                _vstatus = "[PENDING] NOLA or ledger balance not available for comparison"
                 _vcolor  = "FFEB9C"
                 _vtier   = "PENDING"
             elif _vdelta <= 1.00:
-                _vstatus = "✅ GOOD NOLA — Within rounding tolerance (≤ $1.00). Proceed."
+                _vstatus = "[GOOD] GOOD NOLA - Within rounding tolerance (<= $1.00). Proceed."
                 _vcolor  = "C6EFCE"
                 _vtier   = "GOOD"
             elif _vdelta <= 50.00:
                 _vstatus = (
-                    f"⚠️  MINOR VARIANCE — ${_vdelta:.2f} difference. "
+                    f"[MINOR] MINOR VARIANCE - ${_vdelta:.2f} difference. "
                     f"Attorney acknowledgment required before proceeding."
                 )
                 _vcolor  = "FFEB9C"
                 _vtier   = "MINOR"
             else:
                 _vstatus = (
-                    f"🔴 BAD NOLA — MATERIAL DISCREPANCY: ${_vdelta:.2f} difference. "
-                    f"Explicit override + logging required. See PRD §42.5."
+                    f"[BAD] BAD NOLA - MATERIAL DISCREPANCY: ${_vdelta:.2f} difference. "
+                    f"Explicit override + logging required. See PRD 42.5."
                 )
                 _vcolor  = "FFC7CE"
                 _vtier   = "BAD"
@@ -4009,9 +4011,9 @@ async def generate_ledger(request: LedgerRequest):
                 ("Variance (%)",         f"{_vpct:.2f}%"    if _vpct  is not None else "N/A"),
                 ("", ""),
                 ("TOLERANCE TIERS (PRD §42.5)", ""),
-                ("≤ $1.00",         "✅ Rounding — Green (no flag, proceed)"),
-                ("$1.01 – $50.00",  "⚠️  Minor Variance — Yellow (attorney acknowledgment required)"),
-                ("> $50.00",        "🔴 Bad NOLA — Red (explicit override + logging required)"),
+                ("<= $1.00",        "[GOOD] Rounding - Green (no flag, proceed)"),
+                ("$1.01 - $50.00",  "[MINOR] Minor Variance - Yellow (attorney acknowledgment required)"),
+                ("> $50.00",        "[BAD] Bad NOLA - Red (explicit override + logging required)"),
                 ("", ""),
                 ("DETERMINATION", ""),
                 ("Status", _vstatus),
@@ -4187,13 +4189,13 @@ async def generate_ledger(request: LedgerRequest):
                 ("COMPUTED TOTALS", ""),
                 ("NOLA Balance",                f"${nola_balance_anchor:.2f}" if nola_balance_anchor else "$0.00"),
                 ("+ Post-NOLA Net Charges",     f"${_post_charges - _post_payments:.2f}"),
-                ("= SUBTOTAL (Association)",    f"${_assoc_subtotal:.2f}"),
+                ("SUBTOTAL (Association)",      f"${_assoc_subtotal:.2f}"),
                 ("+ Attorney Charges",          f"${_soa_cert + _soa_ocost + _soa_atty:.2f}"),
-                ("= TOTAL OUTSTANDING",         f"${_soa_total:.2f}"),
+                ("TOTAL OUTSTANDING",           f"${_soa_total:.2f}"),
                 ("", ""),
                 ("VERIFICATION", ""),
                 ("SOA Total (Sheet 1)",         f"${_soa_total:.2f}"),
-                ("NOLA-Ledger TOTALS (Sheet 2)", f"= Sheet 2 running balance"),
+                ("NOLA-Ledger TOTALS (Sheet 2)", "Sheet 2 running balance"),
                 ("Demand Letter Total",         f"${_soa_total:.2f}"),
                 ("All Three Match?",            "YES — Single source of truth"),
             ])
@@ -4228,6 +4230,33 @@ async def generate_ledger(request: LedgerRequest):
             ws_fv.freeze_panes = "A2"
 
     await asyncio.to_thread(_build_excel)
+
+    # ── Post-process xlsx: fix empty cached values in formula cells ───────
+    # openpyxl writes <f>formula</f><v></v> (empty cached value) for all
+    # formula cells.  Excel flags the empty <v></v> as content corruption.
+    # Strip them so Excel recalculates cleanly on open (fullCalcOnLoad=1).
+    def _fix_xlsx(filepath):
+        import zipfile as _zf
+        import re as _rxf
+        import tempfile
+        tmp_fd, tmp_path = tempfile.mkstemp(suffix=".xlsx")
+        os.close(tmp_fd)
+        try:
+            with _zf.ZipFile(filepath, "r") as zin, _zf.ZipFile(tmp_path, "w", _zf.ZIP_DEFLATED) as zout:
+                for item in zin.infolist():
+                    data = zin.read(item.filename)
+                    if item.filename.startswith("xl/worksheets/") and item.filename.endswith(".xml"):
+                        xml = data.decode("utf-8")
+                        # Remove empty <v></v> from formula cells
+                        xml = _rxf.sub(r"(<f>.*?</f>)<v></v>", r"\1", xml)
+                        data = xml.encode("utf-8")
+                    zout.writestr(item, data)
+            shutil.move(tmp_path, str(filepath))
+        except Exception:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+
+    await asyncio.to_thread(_fix_xlsx, out_path)
 
     # ── Claude Post-Generation Review (Step 2) ────────────────────────────
     # Claude reviews the generated output like an attorney paired legal review.
