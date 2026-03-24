@@ -1,0 +1,30 @@
+@import url('https://fonts.googleapis.com/css2?family=Public+Sans:wght@300;400;500;600;700;800;900&display=swap');
+@import "tailwindcss";
+
+@theme {
+  --color-primary: #1F6F5C;
+  --color-accent: #F2C94C;
+  --color-sidebar-bg: #1F6F5C;
+  --color-bg-light: #f8f6f6;
+  --font-sans: "Public Sans", ui-sans-serif, system-ui, sans-serif;
+}
+
+@layer base {
+  body {
+    @apply font-sans text-slate-900 bg-bg-light;
+  }
+}
+
+.sidebar-active {
+  @apply bg-white/10 border-l-4 border-accent;
+}
+
+.custom-scrollbar::-webkit-scrollbar { width: 4px; }
+.custom-scrollbar::-webkit-scrollbar-track { background: transparent; }
+.custom-scrollbar::-webkit-scrollbar-thumb { background: #e5e7eb; border-radius: 10px; }
+
+.markdown-body p { @apply mb-3 last:mb-0; }
+.markdown-body strong { @apply font-black text-primary; }
+.markdown-body ul, .markdown-body ol { @apply mb-3 pl-4 list-disc; }
+.markdown-body li { @apply mb-1; }
+.markdown-body code { @apply px-1 py-0.5 bg-slate-100 rounded text-[10px] font-mono text-primary; }
