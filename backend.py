@@ -3116,6 +3116,12 @@ async def generate_ledger(request: LedgerRequest):
         + totals["interest"] + totals["late_fees"] + totals["legal_atty"]
         + totals["other"] - totals["payments"] - totals["credits"], 2
     )
+    # Association-only balance: excludes upstream attorney fees (below the line)
+    assoc_net_balance = round(
+        totals["maintenance"] + totals["special"] + totals["water"]
+        + totals["interest"] + totals["late_fees"]
+        + totals["other"] - totals["payments"] - totals["credits"], 2
+    )
 
     # ── Association Ledger: compute ledger-derived running balance AT NOLA date ─
     # Used by NOLA Validation sheet to apply 3-tier tolerance. PRD §42.5
@@ -3339,9 +3345,10 @@ async def generate_ledger(request: LedgerRequest):
             _soa_late    = max(_ledger_late, _iq_late)  # use the higher of ledger vs IQ-225 accrual
             _soa_other = round(totals["other"], 2)
             _soa_pay   = round(totals["payments"] + totals["credits"], 2)
-            # Recalculate total to include the late fee adjustment
+            # Recalculate total: association charges + late fee adjustment + attorney charges
+            # Use assoc_net_balance (excludes upstream attorney fees) to avoid double-counting
             _late_adj  = round(_soa_late - _ledger_late, 2)
-            _soa_total = round(net_balance + _late_adj + _soa_cert + _soa_ocost + _soa_atty, 2)
+            _soa_total = round(assoc_net_balance + _late_adj + _soa_cert + _soa_ocost + _soa_atty, 2)
 
             # PRD §49.2 — 9-row demand letter table (identical to First Demand Letter)
             # PRD §50.1 — no blank fields; show $0.00 for zeros
@@ -3510,43 +3517,23 @@ async def generate_ledger(request: LedgerRequest):
                     _found_nola = True
                     continue
                 if _found_nola:
-                    nl_split_rows.append(_make_split_row(_row_counter, _li))
-                    _row_counter += 1
+                    # Skip attorney-type items — they go below the line (PRD §15.7)
+                    _li_type = str(_li.get("type", ""))
+                    _li_desc = str(_li.get("description", "")).lower()
+                    _is_atty_item = (
+                        _li_type in ("Attorney Fee", "Collection Cost")
+                        or "attorney" in _li_desc
+                        or "certified mail" in _li_desc
+                        or "other attorney" in _li_desc
+                    )
+                    if not _is_atty_item:
+                        nl_split_rows.append(_make_split_row(_row_counter, _li))
+                        _row_counter += 1
 
             # (Catch-up assessment rows are already in line_items — added upstream
             # before _build_ledger_rows_and_totals. They'll appear via Section C loop.)
-
-            # Section C-3: Attorney-entered charges (PRD §15.7)
-            # These must appear as explicit line items in the NOLA-Ledger so
-            # Sheet 1 (SOA) and Sheet 2 (NOLA-Ledger) totals are identical.
-            _atty_date = datetime.date.today().strftime("%m/%d/%Y")
-            if _soa_cert > 0:
-                nl_split_rows.append(_make_split_row(_row_counter, {
-                    "date": _atty_date,
-                    "description": "Certified Mail / Service Charges",
-                    "type": "Other",
-                    "charge": _soa_cert, "credit": 0.0,
-                    "notes": "CondoClaw Auto-Applied",
-                }))
-                _row_counter += 1
-            if _soa_ocost > 0:
-                nl_split_rows.append(_make_split_row(_row_counter, {
-                    "date": _atty_date,
-                    "description": "Other Attorney Costs",
-                    "type": "Other",
-                    "charge": _soa_ocost, "credit": 0.0,
-                    "notes": "CondoClaw Auto-Applied",
-                }))
-                _row_counter += 1
-            if _soa_atty > 0:
-                nl_split_rows.append(_make_split_row(_row_counter, {
-                    "date": _atty_date,
-                    "description": "Attorney's Fees",
-                    "type": "Attorney Fee",
-                    "charge": _soa_atty, "credit": 0.0,
-                    "notes": "CondoClaw Auto-Applied",
-                }))
-                _row_counter += 1
+            # NOTE: Attorney-entered charges (cert mail, costs, attorney fees)
+            # are added BELOW THE LINE after the TOTALS row — see Section G below.
 
             # Section D-pre: Current Balance row (before projections)
             # This is a REFERENCE-ONLY row showing the management company's stated
@@ -3595,6 +3582,10 @@ async def generate_ledger(request: LedgerRequest):
             _RB_LET = "N"  # Running Balance column letter
             _CHARGE_FORMULA = "E{r}+F{r}+G{r}+H{r}+I{r}+J{r}+K{r}-L{r}-M{r}"
             _nola_excel_row = (_nola_anchor_idx + 2) if _nola_anchor_idx is not None else None
+            # Column mapping: E=5 Maintenance, F=6 Special Asmt, G=7 Water/Utility,
+            #   H=8 Interest, I=9 Late Fees, J=10 Legal/Atty, K=11 Other,
+            #   L=12 Payments, M=13 Credits
+            _sum_cols = {5: "E", 6: "F", 7: "G", 8: "H", 9: "I", 10: "J", 11: "K", 12: "L", 13: "M"}
 
             # Determine the range of RELEVANT pre-NOLA data rows for the NOLA SUM.
             # Only relevant rows (delinquency period) are included — irrelevant rows
@@ -3634,9 +3625,18 @@ async def generate_ledger(request: LedgerRequest):
                 if _is_current_bal:
                     # Current Balance row is REFERENCE ONLY — shows the uploaded
                     # management ledger's stated balance for cross-checking.
-                    # No SUM formulas — this row is NOT part of the computation.
-                    _stated_bal = net_balance  # from generate_ledger's totals
-                    _kc = ws_nl.cell(row=_xl_row, column=_RB_COL, value=round(_stated_bal, 2))
+                    # Add SUM formulas for each category column so the breakdown
+                    # is visible, but this row is excluded from TOTALS.
+                    if _nola_excel_row:
+                        _cb_sum_end = _xl_row - 1  # row before Current Balance
+                        for _cb_col_n, _cb_col_l in _sum_cols.items():
+                            _cb_fc = ws_nl.cell(
+                                row=_xl_row, column=_cb_col_n,
+                                value=f"=SUM({_cb_col_l}{_nola_excel_row}:{_cb_col_l}{_cb_sum_end})")
+                            _cb_fc.number_format = '#,##0.00'
+                    # Running Balance = sum of all charge columns for this row
+                    _kc = ws_nl.cell(row=_xl_row, column=_RB_COL,
+                                     value=f"={_CHARGE_FORMULA.format(r=_xl_row)}")
                     _kc.number_format = '"$"#,##0.00'
                     continue
 
@@ -3747,10 +3747,6 @@ async def generate_ledger(request: LedgerRequest):
             _nl_tot_row   = _nl_last_data + 1
             # SUM range starts at NOLA anchor row (excludes pre-NOLA history)
             _sum_start = _nola_excel_row if _nola_excel_row else 2
-            # Column mapping: E=5 Maintenance, F=6 Special Asmt, G=7 Water/Utility,
-            #   H=8 Interest, I=9 Late Fees, J=10 Legal/Atty, K=11 Other,
-            #   L=12 Payments, M=13 Credits
-            _sum_cols = {5: "E", 6: "F", 7: "G", 8: "H", 9: "I", 10: "J", 11: "K", 12: "L", 13: "M"}
             _nl_tot_static = ["", "", "TOTALS", ""]
             for _ci, _sv in enumerate(_nl_tot_static, 1):
                 _tc = ws_nl.cell(row=_nl_tot_row, column=_ci, value=_sv)
@@ -3804,6 +3800,103 @@ async def generate_ledger(request: LedgerRequest):
                     _c.fill   = (navy if _lbl == "TOTALS SUMMARY"
                                  else gold if _lbl == "NET BALANCE DUE" else lt_blue)
 
+            # ── Section G: Attorney charges BELOW THE LINE (PRD §15.7) ────────
+            # Attorney-entered charges haven't occurred yet and are separate from
+            # association charges.  They appear after the TOTALS summary block.
+            _atty_section_start = ws_nl.max_row + 2
+            _atty_sep_row = _atty_section_start
+            _atty_sep = ws_nl.cell(row=_atty_sep_row, column=3,
+                                   value="ATTORNEY CHARGES (below the line)")
+            for _ac_sep in range(1, 16):
+                _asc = ws_nl.cell(row=_atty_sep_row, column=_ac_sep)
+                _asc.fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
+                _asc.font = Font(bold=True, color="FFFFFF", size=9, italic=True)
+                _asc.border = thin
+                _asc.alignment = Alignment(horizontal="center", vertical="center")
+
+            _atty_date = datetime.date.today().strftime("%m/%d/%Y")
+            _atty_data_start = _atty_sep_row + 1
+            _atty_rows = []
+            _atty_cert_xl_row = None   # track Excel row for SOA formula references
+            _atty_ocost_xl_row = None
+            _atty_fees_xl_row = None
+            if _soa_cert > 0:
+                _atty_cert_xl_row = _atty_data_start + len(_atty_rows)
+                _atty_rows.append({
+                    "date": _atty_date,
+                    "description": "Certified Mail / Service Charges",
+                    "type": "Other",
+                    "charge": _soa_cert, "credit": 0.0,
+                    "notes": "CondoClaw Auto-Applied",
+                })
+            if _soa_ocost > 0:
+                _atty_ocost_xl_row = _atty_data_start + len(_atty_rows)
+                _atty_rows.append({
+                    "date": _atty_date,
+                    "description": "Other Attorney Costs",
+                    "type": "Other",
+                    "charge": _soa_ocost, "credit": 0.0,
+                    "notes": "CondoClaw Auto-Applied",
+                })
+            if _soa_atty > 0:
+                _atty_fees_xl_row = _atty_data_start + len(_atty_rows)
+                _atty_rows.append({
+                    "date": _atty_date,
+                    "description": "Attorney's Fees",
+                    "type": "Attorney Fee",
+                    "charge": _soa_atty, "credit": 0.0,
+                    "notes": "CondoClaw Auto-Applied",
+                })
+
+            _atty_fill = PatternFill(start_color="D6E4F0", end_color="D6E4F0", fill_type="solid")
+            for _ai, _ar in enumerate(_atty_rows):
+                _ar_xl = _atty_data_start + _ai
+                _ar_split = _make_split_row(_ai + 1, _ar)
+                for _aci, _av in enumerate(_ar_split, 1):
+                    _ac_cell = ws_nl.cell(row=_ar_xl, column=_aci, value=_av)
+                    _ac_cell.border = thin
+                    _ac_cell.fill = _atty_fill
+                    _ac_cell.font = Font(size=10)
+                    if _aci >= 5 and _aci <= 14 and isinstance(_av, (int, float)):
+                        _ac_cell.number_format = '#,##0.00'
+
+            # TOTAL OUTSTANDING row: association subtotal + attorney charges
+            _atty_last = _atty_data_start + len(_atty_rows) - 1 if _atty_rows else _atty_data_start
+            _grand_total_row = _atty_last + 1
+            _gt_label = ws_nl.cell(row=_grand_total_row, column=3, value="TOTAL OUTSTANDING")
+            _gt_label.font = Font(bold=True, size=11); _gt_label.fill = gold; _gt_label.border = thin
+            # Sum each category from TOTALS row + attorney rows
+            for _gt_col_n, _gt_col_l in _sum_cols.items():
+                _gt_formula = f"={_gt_col_l}{_nl_tot_row}"
+                if _atty_rows:
+                    _gt_formula += f"+SUM({_gt_col_l}{_atty_data_start}:{_gt_col_l}{_atty_last})"
+                _gt_c = ws_nl.cell(row=_grand_total_row, column=_gt_col_n, value=_gt_formula)
+                _gt_c.number_format = '#,##0.00'
+                _gt_c.font = Font(bold=True, size=11); _gt_c.fill = gold; _gt_c.border = thin
+            # Grand total running balance
+            _gt_rb = ws_nl.cell(row=_grand_total_row, column=_RB_COL,
+                                value=f"={_RB_LET}{_nl_tot_row}+SUM(K{_atty_data_start}:K{_atty_last})+SUM(J{_atty_data_start}:J{_atty_last})")
+            _gt_rb.number_format = '"$"#,##0.00'
+            _gt_rb.font = Font(bold=True, size=11); _gt_rb.fill = gold; _gt_rb.border = thin
+            for _gt_fill_col in (1, 2, 4, 15):
+                _gt_fc = ws_nl.cell(row=_grand_total_row, column=_gt_fill_col)
+                _gt_fc.fill = gold; _gt_fc.border = thin
+
+            # ── SOA value overwrite: replace pandas-written strings with ──────
+            # consistent dollar-formatted strings.  _read_soa_from_excel() uses
+            # _parse_dollar() to read these back.  All rows must have a value —
+            # never blank — use "$0.00" for zeros (PRD §50.1).
+            _NL = "'NOLA-Ledger'!"  # sheet reference prefix (for verification formulas)
+            ws_soa.cell(row=2,  column=2, value=_soa_money(_soa_maint))
+            ws_soa.cell(row=3,  column=2, value=_soa_money(_soa_spcl))
+            ws_soa.cell(row=4,  column=2, value=_soa_money(_soa_late))
+            ws_soa.cell(row=5,  column=2, value=_soa_money(_soa_other))
+            ws_soa.cell(row=6,  column=2, value=_soa_money(_soa_cert))
+            ws_soa.cell(row=7,  column=2, value=_soa_money(_soa_ocost))
+            ws_soa.cell(row=8,  column=2, value=_soa_money(_soa_atty))
+            ws_soa.cell(row=9,  column=2, value=f"(${abs(float(_soa_pay)):,.2f})" if _soa_pay else "$0.00")
+            ws_soa.cell(row=10, column=2, value=_soa_money(_soa_total))
+
             # ── Cross-sheet verification: SOA ↔ NOLA-Ledger (PRD §47.3) ────
             # Add a live formula on the SOA that checks against NOLA-Ledger.
             if _soa_total_row:
@@ -3816,9 +3909,9 @@ async def generate_ledger(request: LedgerRequest):
                 ws_soa.cell(row=_vr, column=2,
                             value=f"=B{_soa_total_row}").number_format = '"$"#,##0.00'
                 _vr += 1
-                ws_soa.cell(row=_vr, column=1, value="NOLA-Ledger Net Balance Due").font = Font(size=9)
+                ws_soa.cell(row=_vr, column=1, value="NOLA-Ledger Total Outstanding").font = Font(size=9)
                 ws_soa.cell(row=_vr, column=2,
-                            value=f"='NOLA-Ledger'!{_RB_LET}{_nl_tot_row}").number_format = '"$"#,##0.00'
+                            value=f"='NOLA-Ledger'!{_RB_LET}{_grand_total_row}").number_format = '"$"#,##0.00'
                 _vr += 1
                 ws_soa.cell(row=_vr, column=1, value="Variance").font = Font(size=9)
                 ws_soa.cell(row=_vr, column=2,
@@ -3828,7 +3921,7 @@ async def generate_ledger(request: LedgerRequest):
                 _status_cell.font = Font(bold=True, size=9)
                 # Compute verification status in Python — unicode in Excel
                 # formulas causes "found a problem with content" corruption.
-                _var_val = abs(_soa_total - (net_balance + _soa_cert + _soa_ocost + _soa_atty))
+                _var_val = abs(_soa_total - (assoc_net_balance + _late_adj + _soa_cert + _soa_ocost + _soa_atty))
                 _verify_text = "VERIFIED - Sheets match" if _var_val < 0.01 else "MISMATCH - Review required"
                 _sv = ws_soa.cell(row=_vr, column=2, value=_verify_text)
                 _sv.font = Font(bold=True, size=9)
@@ -3932,9 +4025,9 @@ async def generate_ledger(request: LedgerRequest):
             ))
 
             # ── PRD §47.3 — Cross-sheet consistency check ────────────────────
-            # SOA Total Outstanding must equal NOLA-Ledger NET BALANCE DUE.
-            # Both should be: net_balance + attorney charges (cert + other costs).
-            _expected_nl_total = round(net_balance + _soa_cert + _soa_ocost, 2)
+            # SOA Total Outstanding must equal NOLA-Ledger TOTAL OUTSTANDING
+            # (association charges + attorney charges below the line).
+            _expected_nl_total = round(assoc_net_balance + _late_adj + _soa_cert + _soa_ocost + _soa_atty, 2)
             _cross_sheet_ok = abs(_soa_total - _expected_nl_total) < 0.01
             if not _cross_sheet_ok:
                 print(f"[CondoClaw] ⚠️  CROSS-SHEET MISMATCH: SOA total=${_soa_total:.2f} "
@@ -4229,16 +4322,64 @@ async def generate_ledger(request: LedgerRequest):
                     row[1].font = Font(size=9)
             ws_fv.freeze_panes = "A2"
 
+            # ── Sanitize all sheets: fix bogus formulas & empty cached vals ──
+            # openpyxl/pandas sometimes writes plain text as formula cells
+            # (e.g. "SUBTOTAL (Association)") and leaves empty cached values
+            # on real formulas.  Both trigger Excel "content problem" warnings.
+            import re as _re_fix
+            _REAL_FORMULA_PAT = _re_fix.compile(
+                r"^=?[A-Z]{1,3}\d|^=?[A-Z]+\(|^=?-[A-Z]|^=?'[^']+?'!")
+            for _ws_fix in writer.book.worksheets:
+                for _row_fix in _ws_fix.iter_rows():
+                    for _cell_fix in _row_fix:
+                        if _cell_fix.data_type == "f":
+                            _fval = str(_cell_fix.value or "")
+                            # Strip leading = for the check
+                            _fcore = _fval.lstrip("=").strip()
+                            if not _REAL_FORMULA_PAT.match(_fcore):
+                                # Bogus formula — force back to string
+                                _cell_fix.data_type = "s"
+                                _cell_fix.value = _fcore
+
     await asyncio.to_thread(_build_excel)
 
-    # ── Post-process xlsx: fix empty cached values in formula cells ───────
-    # openpyxl writes <f>formula</f><v></v> (empty cached value) for all
-    # formula cells.  Excel flags the empty <v></v> as content corruption.
-    # Strip them so Excel recalculates cleanly on open (fullCalcOnLoad=1).
+    # ── Post-process xlsx: fix formula cells that cause Excel warnings ────
+    # 1. openpyxl writes <f>formula</f><v></v> — empty cached values trigger
+    #    "We found a problem with some content" warnings.
+    # 2. openpyxl/pandas sometimes writes plain text as <f> formula cells
+    #    (e.g. "SUBTOTAL (Association)") — Excel can't parse these.
+    # 3. IF formulas with Unicode chars (✓ ✗ —) corrupt the file.
     def _fix_xlsx(filepath):
         import zipfile as _zf
         import re as _rxf
         import tempfile
+
+        # Pattern for a REAL Excel formula: starts with cell ref, function,
+        # operator, number, quote, or cross-sheet ref like 'Sheet'!
+        _REAL_FORMULA = _rxf.compile(
+            r"^[A-Z]{1,3}\d|^[A-Z]+\(|^-[A-Z]|^'[^']+?'!|^IF\(|^SUM\(|^ABS\(")
+
+        def _fix_cell(m):
+            """Fix a single <c>...</c> element that contains a <f> tag."""
+            full = m.group(0)
+            f_match = _rxf.search(r"<f>(.*?)</f>", full)
+            if not f_match:
+                return full
+            formula = f_match.group(1).strip()
+            # Check if it's a real formula
+            if _REAL_FORMULA.match(formula):
+                # Real formula — just strip the empty <v></v>
+                return _rxf.sub(r"<v></v>", "", full)
+            else:
+                # Bogus formula (plain text misidentified) — convert to inline string
+                # Extract style attribute if present
+                s_match = _rxf.search(r's="(\d+)"', full)
+                r_match = _rxf.search(r'r="([A-Z]+\d+)"', full)
+                ref = r_match.group(1) if r_match else ""
+                s_attr = f' s="{s_match.group(1)}"' if s_match else ""
+                text = formula.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                return f'<c r="{ref}"{s_attr} t="inlineStr"><is><t>{text}</t></is></c>'
+
         tmp_fd, tmp_path = tempfile.mkstemp(suffix=".xlsx")
         os.close(tmp_fd)
         try:
@@ -4247,16 +4388,21 @@ async def generate_ledger(request: LedgerRequest):
                     data = zin.read(item.filename)
                     if item.filename.startswith("xl/worksheets/") and item.filename.endswith(".xml"):
                         xml = data.decode("utf-8")
-                        # Remove empty <v></v> from formula cells
-                        xml = _rxf.sub(r"(<f>.*?</f>)<v></v>", r"\1", xml)
+                        # Fix every cell that contains a <f> tag
+                        xml = _rxf.sub(r"<c r=\"[A-Z]+\d+\"[^>]*>.*?</c>",
+                                       lambda m: _fix_cell(m) if "<f>" in m.group(0) else m.group(0),
+                                       xml)
                         data = xml.encode("utf-8")
                     zout.writestr(item, data)
             shutil.move(tmp_path, str(filepath))
-        except Exception:
+        except Exception as _e:
+            print(f"[CondoClaw] _fix_xlsx error: {_e}")
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)
 
+    print(f"[CondoClaw] Running _fix_xlsx on {out_path} ...")
     await asyncio.to_thread(_fix_xlsx, out_path)
+    print(f"[CondoClaw] _fix_xlsx complete.")
 
     # ── Claude Post-Generation Review (Step 2) ────────────────────────────
     # Claude reviews the generated output like an attorney paired legal review.
