@@ -351,11 +351,22 @@ def _regex_extract(text: str, doc_type: str) -> dict:
     if m2 and not e.get("property_address"):
         e["property_address"] = m2.group(1).strip()
 
-    # --- Unit number (from address #NNN or account suffix) ---
-    if e.get("property_address"):
+    # --- Unit number ---
+    # Priority 1: explicit "Unit Number: NNN" label (highest confidence)
+    m = _re.search(r"Unit\s+Number:\s*(\S+)", text, _re.IGNORECASE)
+    if m:
+        e["unit_number"] = m.group(1).strip().rstrip(".")
+    # Priority 2: address hash notation "#NNN"
+    if not e.get("unit_number") and e.get("property_address"):
         m = _re.search(r"#(\d+)", e["property_address"])
         if m:
             e["unit_number"] = m.group(1)
+    # Priority 3: "Unit NNN" in address (no hash)
+    if not e.get("unit_number") and e.get("property_address"):
+        m = _re.search(r"Unit\s+(\d+)", e["property_address"], _re.IGNORECASE)
+        if m:
+            e["unit_number"] = m.group(1)
+    # Priority 4: account number suffix (least reliable — may include folio prefix)
     m = _re.search(r"Account\s+(?:Number|#)?:\s*\w+?(\d{3,})\b", text, _re.IGNORECASE)
     if m and not e.get("unit_number"):
         e["unit_number"] = m.group(1)
@@ -1792,6 +1803,11 @@ async def parse_analyze(payload: dict):
         summary = entities.pop("summary", f"{doc_type.upper()} parsed: {filename}")
         details = entities.pop("details", "NLP extraction complete.")
         elapsed = round((datetime.datetime.now() - t0).total_seconds(), 2)
+        # Override unit_number with regex extraction — AI may return account
+        # codes like "556102" (folio+unit) instead of the actual unit "102".
+        _regex_ents = _regex_extract(raw_text, doc_type)
+        if _regex_ents.get("unit_number"):
+            entities["unit_number"] = _regex_ents["unit_number"]
         _record_upload(filename, file_path, doc_type, len(raw_text), entities, summary, similarity)
         return {"status": "success", "parsedData": {
             "summary": summary, "details": details,
@@ -2411,6 +2427,21 @@ async def generate_first_letter(request: FirstLetterRequest):
 
     today = datetime.date.today().strftime("%B %d, %Y")
 
+    # ── Re-extract unit number from NOLA on disk (authoritative) ──────────
+    _nola_on_disk_fl = sorted(
+        [fp for fp in UPLOAD_DIR.iterdir()
+         if fp.suffix.lower() == ".pdf"
+         and any(kw in fp.name.lower() for kw in ("nola", "notice"))],
+        key=lambda fp: fp.stat().st_mtime, reverse=True,
+    )
+    if _nola_on_disk_fl:
+        _nola_ents_fl = _regex_extract(
+            extract_text_from_file(_nola_on_disk_fl[0].read_bytes(), _nola_on_disk_fl[0].name),
+            "nola",
+        )
+        if _nola_ents_fl.get("unit_number"):
+            e["unit_number"] = _nola_ents_fl["unit_number"]
+
     # Detect statute from entities (auto-classifies Condo vs HOA)
     statute, entity_type, lien_section, notice_section = _detect_statute(e)
     sc = STATUTE_COMPLIANCE[statute]
@@ -2643,6 +2674,23 @@ async def generate_ledger(request: LedgerRequest):
     e = request.entities
     today_str     = datetime.date.today().strftime("%Y-%m-%d")
     today_display = datetime.date.today().strftime("%B %d, %Y")
+
+    # ── Re-extract unit number from NOLA on disk (authoritative) ──────────
+    # The frontend may send a stale unit_number from a cached parse (e.g.
+    # "556102" from an account code).  Always prefer the NOLA's own value.
+    _nola_on_disk = sorted(
+        [fp for fp in UPLOAD_DIR.iterdir()
+         if fp.suffix.lower() == ".pdf"
+         and any(kw in fp.name.lower() for kw in ("nola", "notice"))],
+        key=lambda fp: fp.stat().st_mtime, reverse=True,
+    )
+    if _nola_on_disk:
+        _nola_ents = _regex_extract(
+            extract_text_from_file(_nola_on_disk[0].read_bytes(), _nola_on_disk[0].name),
+            "nola",
+        )
+        if _nola_ents.get("unit_number"):
+            e["unit_number"] = _nola_ents["unit_number"]
 
     statute, entity_type, lien_section, _ = _detect_statute(e)
     sc = STATUTE_COMPLIANCE[statute]
@@ -3055,7 +3103,18 @@ async def generate_ledger(request: LedgerRequest):
     # ── Catch-up assessment rows: months between ledger end and today ────────
     # If the management ledger ends before today, add monthly assessment rows
     # for the gap period.  These are real charges the owner owes.
+    # Derive monthly rate from the actual ledger transactions (most common
+    # Regular Assessment charge) — don't rely on entities dict which may be empty.
     _monthly_rate_cu = _to_float(e.get("monthly_assessment", "0"))
+    if _monthly_rate_cu <= 0 and line_items:
+        from collections import Counter as _CUCounter
+        _cu_asmt_vals = [
+            _to_float(t.get("charge", 0)) for t in line_items
+            if str(t.get("type", "")).strip() == "Regular Assessment"
+            and _to_float(t.get("charge", 0)) > 0
+        ]
+        if _cu_asmt_vals:
+            _monthly_rate_cu = _CUCounter(_cu_asmt_vals).most_common(1)[0][0]
     if _monthly_rate_cu > 0 and line_items:
         _last_li_date = None
         for _li_cu in reversed(line_items):
@@ -3330,25 +3389,20 @@ async def generate_ledger(request: LedgerRequest):
             )
             _through_lbl_soa = f"{_through_soa.strftime('%B')} {_through_soa.day}, {_through_soa.year}"
 
-            # All 9 values derive from the NOLA-Ledger computation (totals + net_balance)
+            # All 9 values derive from the NOLA-Ledger computation (totals)
             # so that SOA, NOLA-Ledger, and demand letter are all consistent (PRD §49).
-            # Attorney-entered charges are added on top of the ledger net balance.
-            # IQ-225 late fee accrual ($25/month for past-due months) supplements the
-            # ledger-derived late_fees when the management ledger doesn't charge them.
+            # Every number must be traceable to the source documents (NOLA + ledger).
+            # Attorney-entered charges (cert mail, costs, fees) are below the line.
             _soa_cert  = float(iq_tbl["certified_mail"]) if iq_tbl else 40.0
             _soa_ocost = float(iq_tbl["other_costs"])    if iq_tbl else 16.0
             _soa_atty  = float(iq_tbl["attorney_fees"])  if iq_tbl else 0.0
             _soa_maint = round(totals["maintenance"], 2)
             _soa_spcl  = round(totals["special"] + totals["water"], 2)
-            _ledger_late = round(totals["late_fees"], 2)
-            _iq_late     = round(float(iq_tbl["late_fees"]), 2) if iq_tbl else 0.0
-            _soa_late    = max(_ledger_late, _iq_late)  # use the higher of ledger vs IQ-225 accrual
+            _soa_late  = round(totals["late_fees"], 2)  # from source docs only — no IQ-225 override
             _soa_other = round(totals["other"], 2)
             _soa_pay   = round(totals["payments"] + totals["credits"], 2)
-            # Recalculate total: association charges + late fee adjustment + attorney charges
-            # Use assoc_net_balance (excludes upstream attorney fees) to avoid double-counting
-            _late_adj  = round(_soa_late - _ledger_late, 2)
-            _soa_total = round(assoc_net_balance + _late_adj + _soa_cert + _soa_ocost + _soa_atty, 2)
+            # Total = association charges + attorney charges (below the line)
+            _soa_total = round(assoc_net_balance + _soa_cert + _soa_ocost + _soa_atty, 2)
 
             # PRD §49.2 — 9-row demand letter table (identical to First Demand Letter)
             # PRD §50.1 — no blank fields; show $0.00 for zeros
@@ -3510,44 +3564,93 @@ async def generate_ledger(request: LedgerRequest):
                     _row_counter += 1
                     break
 
-            # Section C: Post-NOLA transactions (everything in line_items after NOLA row)
+            # Section C: Post-NOLA transactions from uploaded ledger
+            # Split into ledger items vs catch-up items so Current Balance
+            # can sit between them — showing where the uploaded ledger ends.
             _found_nola = False
+            _catchup_items = []
             for _li in line_items:
                 if "NOLA ground truth" in str(_li.get("notes", "")):
                     _found_nola = True
                     continue
                 if _found_nola:
-                    # Skip attorney-type items — they go below the line (PRD §15.7)
                     _li_type = str(_li.get("type", ""))
                     _li_desc = str(_li.get("description", "")).lower()
+                    _li_notes = str(_li.get("notes", "")).lower()
+                    # Skip attorney-type items — below the line (PRD §15.7)
                     _is_atty_item = (
                         _li_type in ("Attorney Fee", "Collection Cost")
                         or "attorney" in _li_desc
                         or "certified mail" in _li_desc
                         or "other attorney" in _li_desc
                     )
-                    if not _is_atty_item:
+                    if _is_atty_item:
+                        continue
+                    # Separate catch-up items from uploaded ledger items
+                    if "catch-up" in _li_notes or "not yet on management" in _li_notes:
+                        _catchup_items.append(_li)
+                    else:
                         nl_split_rows.append(_make_split_row(_row_counter, _li))
                         _row_counter += 1
 
-            # (Catch-up assessment rows are already in line_items — added upstream
-            # before _build_ledger_rows_and_totals. They'll appear via Section C loop.)
-            # NOTE: Attorney-entered charges (cert mail, costs, attorney fees)
-            # are added BELOW THE LINE after the TOTALS row — see Section G below.
-
-            # Section D-pre: Current Balance row (before projections)
-            # This is a REFERENCE-ONLY row showing the management company's stated
-            # ledger balance.  It is NOT included in totals or running balance
-            # calculations — it exists solely for cross-checking. (PRD §42.3)
+            # Section D: Current Balance (end of uploaded ledger — reference only)
             _current_bal_idx = len(nl_split_rows)
             nl_split_rows.append([
                 "", "", "CURRENT BALANCE (per uploaded ledger — reference only)", "Current Balance",
                 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-                0.0,  # placeholder — NOT a formula, just for layout
-                "REFERENCE ONLY — not included in totals"
+                0.0, "REFERENCE ONLY — end of uploaded ledger"
             ])
 
-            # Section D: 45-day forward projections
+            # Section E: Catch-up months (assessments accrued since ledger ended)
+            # These appear BELOW the Current Balance so the user can see what
+            # has accrued between the ledger end date and today.
+            if _catchup_items:
+                nl_split_rows.append([
+                    "", "", "── CATCH-UP ASSESSMENTS (since ledger end date) ──",
+                    "Separator", None, None, None, None, None, None, None, None, None, None,
+                    "Monthly assessments not yet on management ledger"
+                ])
+                for _cu in _catchup_items:
+                    nl_split_rows.append(_make_split_row(_row_counter, _cu))
+                    _row_counter += 1
+
+            # Section F: Attorney charges — right below catch-up, part of the
+            # main table so the ledger is one coherent block.
+            _atty_inline_start_idx = len(nl_split_rows)
+            _atty_date_str = datetime.date.today().strftime("%m/%d/%Y")
+            if _soa_cert > 0 or _soa_ocost > 0 or _soa_atty > 0:
+                nl_split_rows.append([
+                    "", "", "── ATTORNEY CHARGES ──",
+                    "Separator", None, None, None, None, None, None, None, None, None, None,
+                    "Attorney-entered charges"
+                ])
+                if _soa_cert > 0:
+                    nl_split_rows.append(_make_split_row(_row_counter, {
+                        "date": _atty_date_str,
+                        "description": "Certified Mail / Service Charges",
+                        "type": "Other", "charge": _soa_cert, "credit": 0.0,
+                        "notes": "CondoClaw Auto-Applied",
+                    }))
+                    _row_counter += 1
+                if _soa_ocost > 0:
+                    nl_split_rows.append(_make_split_row(_row_counter, {
+                        "date": _atty_date_str,
+                        "description": "Other Attorney Costs",
+                        "type": "Other", "charge": _soa_ocost, "credit": 0.0,
+                        "notes": "CondoClaw Auto-Applied",
+                    }))
+                    _row_counter += 1
+                if _soa_atty > 0:
+                    nl_split_rows.append(_make_split_row(_row_counter, {
+                        "date": _atty_date_str,
+                        "description": "Attorney's Fees",
+                        "type": "Attorney Fee", "charge": _soa_atty, "credit": 0.0,
+                        "notes": "CondoClaw Auto-Applied",
+                    }))
+                    _row_counter += 1
+            _atty_inline_end_idx = len(nl_split_rows)
+
+            # Section G: 45-day forward projections
             if _projection_rows:
                 nl_split_rows.append([
                     "", "", "── 45-DAY FORWARD PROJECTION (PRD §42.6) ──",
@@ -3712,6 +3815,7 @@ async def generate_ledger(request: LedgerRequest):
                 _is_sep  = _type_v == "Separator"
                 _is_proj = _type_v == "Projected Assessment"
                 _is_cur_bal = _type_v == "Current Balance"
+                _is_atty_inline = (_atty_inline_start_idx <= _di < _atty_inline_end_idx) and not _is_sep
                 _is_pre  = (_di < (_nola_anchor_idx or 0)) and not _is_sep
                 _is_relevant = _pre_nola_relevance.get(_di, True)
                 for cell in row:
@@ -3730,6 +3834,9 @@ async def generate_ledger(request: LedgerRequest):
                     elif _is_proj:
                         cell.fill = _proj_fill
                         cell.font = Font(italic=True, size=9)
+                    elif _is_atty_inline:
+                        cell.fill = PatternFill(start_color="D6E4F0", end_color="D6E4F0", fill_type="solid")
+                        cell.font = Font(size=10)
                     elif _is_pre and _is_relevant:
                         cell.fill = _pre_relevant_fill
                         cell.font = Font(size=9, color="444444")
@@ -3737,150 +3844,91 @@ async def generate_ledger(request: LedgerRequest):
                         cell.fill = _pre_irrelevant_fill
                         cell.font = Font(size=9, color="999999", italic=True)
 
-            # ---- Totals row — SUM formulas from NOLA row onward ------------
-            # IMPORTANT: Exclude the CURRENT BALANCE row from the SUM range.
-            # CURRENT BALANCE is itself a SUM of the same rows — including it
-            # would double-count every charge.  Use two non-overlapping ranges:
-            #   Range 1: NOLA row → row before CURRENT BALANCE
-            #   Range 2: row after CURRENT BALANCE → last data row (projections)
+            # ---- TOTAL OUTSTANDING row — single total at the bottom --------
+            # Sums all charges from NOLA row onward, excluding the CURRENT
+            # BALANCE row (which is itself a SUM and would double-count).
+            # Attorney charges and projections are now inline in the table,
+            # so one SUM range with CB subtracted covers everything.
             _nl_last_data = ws_nl.max_row
-            _nl_tot_row   = _nl_last_data + 1
-            # SUM range starts at NOLA anchor row (excludes pre-NOLA history)
+            _grand_total_row = _nl_last_data + 1
             _sum_start = _nola_excel_row if _nola_excel_row else 2
-            _nl_tot_static = ["", "", "TOTALS", ""]
-            for _ci, _sv in enumerate(_nl_tot_static, 1):
-                _tc = ws_nl.cell(row=_nl_tot_row, column=_ci, value=_sv)
+            _cb_xl = _current_bal_excel_row
+
+            # Static label cells for TOTAL OUTSTANDING
+            for _ci, _sv in enumerate(["", "", "TOTAL OUTSTANDING", ""], 1):
+                _tc = ws_nl.cell(row=_grand_total_row, column=_ci, value=_sv)
                 _tc.font = Font(bold=True, size=11); _tc.fill = gold
                 _tc.border = thin; _tc.alignment = Alignment(horizontal="center")
-            _cb_xl = _current_bal_excel_row  # Excel row of CURRENT BALANCE
+
+            # SUM formulas: SUM(NOLA:last_data) - CB row (to avoid double-count)
             for _col_n, _col_l in _sum_cols.items():
-                # Sum ONLY actual charges: NOLA row through row before CURRENT BALANCE.
-                # 45-day projections are informational and excluded from TOTALS
-                # so that TOTALS matches the SOA and demand letter (PRD §47.3).
-                _tc = ws_nl.cell(row=_nl_tot_row, column=_col_n,
-                                 value=f"=SUM({_col_l}{_sum_start}:{_col_l}{_cb_xl - 1})")
-                _tc.number_format = '#,##0.00'
-                _tc.font = Font(bold=True, size=11); _tc.fill = gold
-                _tc.border = thin; _tc.alignment = Alignment(horizontal="center")
-            # Running Balance = last actual data row before Current Balance
-            _last_data_before_cb = _cb_xl - 1
-            _tc_l = ws_nl.cell(row=_nl_tot_row, column=_RB_COL,
-                               value=f"={_RB_LET}{_last_data_before_cb}")
-            _tc_l.number_format = '"$"#,##0.00'
-            _tc_l.font = Font(bold=True, size=11); _tc_l.fill = gold
-            _tc_l.border = thin; _tc_l.alignment = Alignment(horizontal="center")
-            ws_nl.cell(row=_nl_tot_row, column=15).border = thin  # Notes col border
-
-            # ---- Summary block — formulas referencing the TOTALS row -------
-            _nl_sum_start = _nl_tot_row + 2
-            _nl_cheat = [
-                ("TOTALS SUMMARY",       ""),
-                ("Total Maintenance",    f"=E{_nl_tot_row}"),
-                ("Total Special Asmt",   f"=F{_nl_tot_row}"),
-                ("Total Water/Utility",  f"=G{_nl_tot_row}"),
-                ("Total Interest",       f"=H{_nl_tot_row}"),
-                ("Total Late Fees",      f"=I{_nl_tot_row}"),
-                ("Total Legal/Atty",     f"=J{_nl_tot_row}"),
-                ("Total Other Charges",  f"=K{_nl_tot_row}"),
-                ("Total Payments",       f"=-L{_nl_tot_row}"),
-                ("Total Credits",        f"=-M{_nl_tot_row}"),
-                ("NET BALANCE DUE",      f"={_RB_LET}{_nl_tot_row}"),
-            ]
-            for _ro, (_lbl, _lv) in enumerate(_nl_cheat):
-                _r    = _nl_sum_start + _ro
-                _cl   = ws_nl.cell(row=_r, column=1, value=_lbl)
-                _cv2  = ws_nl.cell(row=_r, column=2, value=_lv)
-                if _lv and str(_lv).startswith("="):
-                    _cv2.number_format = '"$"#,##0.00'
-                _hdr  = _lbl in ("TOTALS SUMMARY", "NET BALANCE DUE")
-                for _c in (_cl, _cv2):
-                    _c.border = thin
-                    _c.font   = Font(bold=True, size=11 if _hdr else 10,
-                                     color="FFFFFF" if _lbl == "TOTALS SUMMARY" else "000000")
-                    _c.fill   = (navy if _lbl == "TOTALS SUMMARY"
-                                 else gold if _lbl == "NET BALANCE DUE" else lt_blue)
-
-            # ── Section G: Attorney charges BELOW THE LINE (PRD §15.7) ────────
-            # Attorney-entered charges haven't occurred yet and are separate from
-            # association charges.  They appear after the TOTALS summary block.
-            _atty_section_start = ws_nl.max_row + 2
-            _atty_sep_row = _atty_section_start
-            _atty_sep = ws_nl.cell(row=_atty_sep_row, column=3,
-                                   value="ATTORNEY CHARGES (below the line)")
-            for _ac_sep in range(1, 16):
-                _asc = ws_nl.cell(row=_atty_sep_row, column=_ac_sep)
-                _asc.fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
-                _asc.font = Font(bold=True, color="FFFFFF", size=9, italic=True)
-                _asc.border = thin
-                _asc.alignment = Alignment(horizontal="center", vertical="center")
-
-            _atty_date = datetime.date.today().strftime("%m/%d/%Y")
-            _atty_data_start = _atty_sep_row + 1
-            _atty_rows = []
-            _atty_cert_xl_row = None   # track Excel row for SOA formula references
-            _atty_ocost_xl_row = None
-            _atty_fees_xl_row = None
-            if _soa_cert > 0:
-                _atty_cert_xl_row = _atty_data_start + len(_atty_rows)
-                _atty_rows.append({
-                    "date": _atty_date,
-                    "description": "Certified Mail / Service Charges",
-                    "type": "Other",
-                    "charge": _soa_cert, "credit": 0.0,
-                    "notes": "CondoClaw Auto-Applied",
-                })
-            if _soa_ocost > 0:
-                _atty_ocost_xl_row = _atty_data_start + len(_atty_rows)
-                _atty_rows.append({
-                    "date": _atty_date,
-                    "description": "Other Attorney Costs",
-                    "type": "Other",
-                    "charge": _soa_ocost, "credit": 0.0,
-                    "notes": "CondoClaw Auto-Applied",
-                })
-            if _soa_atty > 0:
-                _atty_fees_xl_row = _atty_data_start + len(_atty_rows)
-                _atty_rows.append({
-                    "date": _atty_date,
-                    "description": "Attorney's Fees",
-                    "type": "Attorney Fee",
-                    "charge": _soa_atty, "credit": 0.0,
-                    "notes": "CondoClaw Auto-Applied",
-                })
-
-            _atty_fill = PatternFill(start_color="D6E4F0", end_color="D6E4F0", fill_type="solid")
-            for _ai, _ar in enumerate(_atty_rows):
-                _ar_xl = _atty_data_start + _ai
-                _ar_split = _make_split_row(_ai + 1, _ar)
-                for _aci, _av in enumerate(_ar_split, 1):
-                    _ac_cell = ws_nl.cell(row=_ar_xl, column=_aci, value=_av)
-                    _ac_cell.border = thin
-                    _ac_cell.fill = _atty_fill
-                    _ac_cell.font = Font(size=10)
-                    if _aci >= 5 and _aci <= 14 and isinstance(_av, (int, float)):
-                        _ac_cell.number_format = '#,##0.00'
-
-            # TOTAL OUTSTANDING row: association subtotal + attorney charges
-            _atty_last = _atty_data_start + len(_atty_rows) - 1 if _atty_rows else _atty_data_start
-            _grand_total_row = _atty_last + 1
-            _gt_label = ws_nl.cell(row=_grand_total_row, column=3, value="TOTAL OUTSTANDING")
-            _gt_label.font = Font(bold=True, size=11); _gt_label.fill = gold; _gt_label.border = thin
-            # Sum each category from TOTALS row + attorney rows
-            for _gt_col_n, _gt_col_l in _sum_cols.items():
-                _gt_formula = f"={_gt_col_l}{_nl_tot_row}"
-                if _atty_rows:
-                    _gt_formula += f"+SUM({_gt_col_l}{_atty_data_start}:{_gt_col_l}{_atty_last})"
-                _gt_c = ws_nl.cell(row=_grand_total_row, column=_gt_col_n, value=_gt_formula)
+                _gt_formula = (
+                    f"=SUM({_col_l}{_sum_start}:{_col_l}{_nl_last_data})"
+                    f"-{_col_l}{_cb_xl}"
+                )
+                _gt_c = ws_nl.cell(row=_grand_total_row, column=_col_n, value=_gt_formula)
                 _gt_c.number_format = '#,##0.00'
-                _gt_c.font = Font(bold=True, size=11); _gt_c.fill = gold; _gt_c.border = thin
-            # Grand total running balance
+                _gt_c.font = Font(bold=True, size=11); _gt_c.fill = gold
+                _gt_c.border = thin; _gt_c.alignment = Alignment(horizontal="center")
+
+            # Running Balance = net of the SUM columns on this row
             _gt_rb = ws_nl.cell(row=_grand_total_row, column=_RB_COL,
-                                value=f"={_RB_LET}{_nl_tot_row}+SUM(K{_atty_data_start}:K{_atty_last})+SUM(J{_atty_data_start}:J{_atty_last})")
+                                value=f"=E{_grand_total_row}+F{_grand_total_row}+G{_grand_total_row}+H{_grand_total_row}+I{_grand_total_row}+J{_grand_total_row}+K{_grand_total_row}-L{_grand_total_row}-M{_grand_total_row}")
             _gt_rb.number_format = '"$"#,##0.00'
-            _gt_rb.font = Font(bold=True, size=11); _gt_rb.fill = gold; _gt_rb.border = thin
-            for _gt_fill_col in (1, 2, 4, 15):
+            _gt_rb.font = Font(bold=True, size=11); _gt_rb.fill = gold
+            _gt_rb.border = thin; _gt_rb.alignment = Alignment(horizontal="center")
+            for _gt_fill_col in (15,):
                 _gt_fc = ws_nl.cell(row=_grand_total_row, column=_gt_fill_col)
                 _gt_fc.fill = gold; _gt_fc.border = thin
+
+            # ── Amount Due Summary — at the very bottom of NOLA-Ledger ────────
+            # Mirrors the demand letter's 9-row table so the user can compare
+            # directly.  Placed after TOTAL OUTSTANDING for easy reference.
+            _amt_due_start = _grand_total_row + 2
+            _atty_light = PatternFill(start_color="D6E4F0", end_color="D6E4F0", fill_type="solid")
+            _nl_amt_due = [
+                ("AMOUNT DUE SUMMARY",                                      "",  "header"),
+                ("Description",                                        "Amount", "col_header"),
+                (f"Maintenance due including {_through_lbl_soa}:",
+                 _soa_money(_soa_maint),                                         "data"),
+                (f"Special assessments due including {_through_lbl_soa}:",
+                 _soa_money(_soa_spcl),                                          "data"),
+                ("Late fees, if applicable:",
+                 _soa_money(_soa_late),                                          "data"),
+                ("Other charges:",
+                 _soa_money(_soa_other),                                         "data"),
+                ("Certified mail charges:",
+                 _soa_money(_soa_cert),                                          "atty"),
+                ("Other costs:",
+                 _soa_money(_soa_ocost),                                         "atty"),
+                ("Attorney's fees:",
+                 _soa_money(_soa_atty),                                          "atty"),
+                ("Partial Payment:",
+                 f"(${abs(float(_soa_pay)):,.2f})" if _soa_pay else "$0.00",     "data"),
+                ("TOTAL OUTSTANDING:",
+                 _soa_money(_soa_total),                                         "total"),
+            ]
+            for _ro, (_lbl, _lv, _style) in enumerate(_nl_amt_due):
+                _r = _amt_due_start + _ro
+                _cl  = ws_nl.cell(row=_r, column=1, value=_lbl)
+                _cv2 = ws_nl.cell(row=_r, column=2, value=_lv)
+                for _c in (_cl, _cv2):
+                    _c.border = thin
+                    if _style == "header":
+                        _c.font = Font(bold=True, size=11, color="FFFFFF")
+                        _c.fill = navy
+                    elif _style == "col_header":
+                        _c.font = Font(bold=True, size=10, italic=True)
+                        _c.fill = PatternFill(start_color="B4C6E7", end_color="B4C6E7", fill_type="solid")
+                    elif _style == "total":
+                        _c.font = Font(bold=True, size=11)
+                        _c.fill = gold
+                    elif _style == "atty":
+                        _c.font = Font(size=10, italic=True)
+                        _c.fill = _atty_light
+                    else:
+                        _c.font = Font(size=10)
+                        _c.fill = lt_blue
 
             # ── SOA value overwrite: replace pandas-written strings with ──────
             # consistent dollar-formatted strings.  _read_soa_from_excel() uses
@@ -3921,7 +3969,7 @@ async def generate_ledger(request: LedgerRequest):
                 _status_cell.font = Font(bold=True, size=9)
                 # Compute verification status in Python — unicode in Excel
                 # formulas causes "found a problem with content" corruption.
-                _var_val = abs(_soa_total - (assoc_net_balance + _late_adj + _soa_cert + _soa_ocost + _soa_atty))
+                _var_val = abs(_soa_total - (assoc_net_balance + _soa_cert + _soa_ocost + _soa_atty))
                 _verify_text = "VERIFIED - Sheets match" if _var_val < 0.01 else "MISMATCH - Review required"
                 _sv = ws_soa.cell(row=_vr, column=2, value=_verify_text)
                 _sv.font = Font(bold=True, size=9)
@@ -4027,7 +4075,7 @@ async def generate_ledger(request: LedgerRequest):
             # ── PRD §47.3 — Cross-sheet consistency check ────────────────────
             # SOA Total Outstanding must equal NOLA-Ledger TOTAL OUTSTANDING
             # (association charges + attorney charges below the line).
-            _expected_nl_total = round(assoc_net_balance + _late_adj + _soa_cert + _soa_ocost + _soa_atty, 2)
+            _expected_nl_total = round(assoc_net_balance + _soa_cert + _soa_ocost + _soa_atty, 2)
             _cross_sheet_ok = abs(_soa_total - _expected_nl_total) < 0.01
             if not _cross_sheet_ok:
                 print(f"[CondoClaw] ⚠️  CROSS-SHEET MISMATCH: SOA total=${_soa_total:.2f} "
@@ -4440,14 +4488,17 @@ async def generate_ledger(request: LedgerRequest):
 
 @app.get("/api/files")
 def list_files():
-    """Return all uploaded and generated files from SQLite."""
+    """Return all uploaded and generated files from SQLite.
+    Only returns generated files that still exist on disk."""
     conn = get_db()
     uploads = [dict(r) for r in conn.execute(
         "SELECT id, filename, doc_type, summary, similarity, created_at FROM uploads ORDER BY created_at DESC"
     ).fetchall()]
-    generated = [dict(r) for r in conn.execute(
+    generated_raw = [dict(r) for r in conn.execute(
         "SELECT id, filename, file_type, matter_id, owner_name, unit_number, created_at FROM generated_files ORDER BY created_at DESC"
     ).fetchall()]
+    # Only return files that actually exist on disk — prevents stale/ghost entries
+    generated = [g for g in generated_raw if (OUTPUT_DIR / g["filename"]).exists()]
     conn.close()
     return {"uploads": uploads, "generated": generated}
 
@@ -4851,6 +4902,13 @@ async def generate_ground_truth(
     today_display = datetime.date.today().strftime("%B %d, %Y")
     statute, entity_type, lien_section, _ = _detect_statute(merged)
     sc = STATUTE_COMPLIANCE[statute]
+    # ── Force unit_number from NOLA on disk (authoritative — prevents 556102) ──
+    _nola_gt = file_map.get("nola", {})
+    if _nola_gt.get("text"):
+        _nola_ents_gt = _regex_extract(_nola_gt["text"], "nola")
+        if _nola_ents_gt.get("unit_number"):
+            merged["unit_number"] = _nola_ents_gt["unit_number"]
+
     owner = merged.get("owner_name", "Unknown")
     unit  = merged.get("unit_number", "—")
     assoc = merged.get("association_name", "The Association")
@@ -5491,6 +5549,20 @@ async def generate_ground_truth(
     # Clean up the legacy file if it differs from the authoritative one
     if _legacy_xl != xl_path and _legacy_xl.exists():
         _legacy_xl.unlink()
+
+    # Clean up stale outputs for the same association/owner with a different
+    # unit slug (e.g. old "556102" files when the correct unit is "102").
+    # This prevents the user from seeing ghost files from prior runs.
+    _new_stem = xl_path.stem  # e.g. "Soleil_Llc_102_Ledger_2026-03-26"
+    for _stale in OUTPUT_DIR.iterdir():
+        if _stale == xl_path:
+            continue
+        # Match same association slug + owner slug but different unit in filename
+        if (_stale.suffix.lower() in (".xlsx", ".docx")
+                and _stale.name.startswith(assoc_slug + "_" + owner_last + "_")
+                and _stale.stem != _new_stem):
+            print(f"[CondoClaw] Removing stale output: {_stale.name}")
+            _stale.unlink()
 
     # ── Sync merged with ledger-derived SOA values so the demand letter matches ──
     # generate_ledger wrote the SOA from its own totals/net_balance.
